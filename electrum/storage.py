@@ -37,6 +37,9 @@ from .plugin import run_hook, plugin_loaders
 from .json_db import JsonDB
 from .logging import Logger
 
+import hmac
+from .crypto import aes_encrypt_with_iv, aes_decrypt_with_iv
+
 
 def get_derivation_used_for_hw_device_encryption():
     return ("m"
@@ -61,37 +64,37 @@ class WalletStorage(Logger):
         self.path = standardize_path(path)
         self._file_exists = self.path and os.path.exists(self.path)
 
-        DB_Class = JsonDB
         self.logger.info(f"wallet path {self.path}")
         self.pubkey = None
         self._test_read_write_permissions(self.path)
         if self.file_exists():
-            with open(self.path, "r", encoding='utf-8') as f:
+            with open(self.path, "rb") as f:
                 self.raw = f.read()
             self._encryption_version = self._init_encryption_version()
             if not self.is_encrypted():
-                self.db = DB_Class(self.raw, manual_upgrades=manual_upgrades)
+                self.db = JsonDB(self.raw.decode('utf8'), manual_upgrades=manual_upgrades)
+                self._write()
                 self.load_plugins()
         else:
             self._encryption_version = StorageEncryptionVersion.PLAINTEXT
             # avoid new wallets getting 'upgraded'
-            self.db = DB_Class('', manual_upgrades=False)
+            self.db = JsonDB('', manual_upgrades=False)
 
     @classmethod
     def _test_read_write_permissions(cls, path):
         # note: There might already be a file at 'path'.
         #       Make sure we do NOT overwrite/corrupt that!
         temp_path = "%s.tmptest.%s" % (path, os.getpid())
-        echo = "fs r/w test"
+        echo = b"fs r/w test"
         try:
             # test READ permissions for actual path
             if os.path.exists(path):
-                with open(path, "r", encoding='utf-8') as f:
+                with open(path, "rb") as f:
                     f.read(1)  # read 1 byte
             # test R/W sanity for "similar" path
-            with open(temp_path, "w", encoding='utf-8') as f:
+            with open(temp_path, "wb") as f:
                 f.write(echo)
-            with open(temp_path, "r", encoding='utf-8') as f:
+            with open(temp_path, "rb") as f:
                 echo2 = f.read()
             os.remove(temp_path)
         except Exception as e:
@@ -113,7 +116,29 @@ class WalletStorage(Logger):
     @profiler
     def write(self):
         with self.lock:
-            self._write()
+            if self.file_exists():
+                self._write_pending_changes()
+            else:
+                #if self.pending_changes:
+                self._write()
+
+    def _write_pending_changes(self):
+        if threading.currentThread().isDaemon():
+            self.logger.warning('daemon thread cannot write db')
+            return
+        if not self.db.pending_changes:
+            return
+        s = ''.join([',\n' + x for x in self.db.pending_changes])
+        s = self.encrypt_for_append(s)
+        with open(self.path, "rb+") as f:
+            f.seek(0, os.SEEK_END)
+            if self.pubkey:
+                size = f.tell()
+                f.seek(size-48, 0)
+            f.write(s)
+            f.flush()
+            os.fsync(f.fileno())
+        self.db.pending_changes = []
 
     def _write(self):
         if threading.currentThread().isDaemon():
@@ -121,10 +146,9 @@ class WalletStorage(Logger):
             return
         if not self.db.modified():
             return
-        self.db.commit()
-        s = self.encrypt_before_writing(self.db.dump())
+        s = self.encrypt_for_write(self.db.dump())
         temp_path = "%s.tmp.%s" % (self.path, os.getpid())
-        with open(temp_path, "w", encoding='utf-8') as f:
+        with open(temp_path, "wb") as f:
             f.write(s)
             f.flush()
             os.fsync(f.fileno())
@@ -137,6 +161,7 @@ class WalletStorage(Logger):
         os.chmod(self.path, mode)
         self._file_exists = True
         self.logger.info(f"saved {self.path}")
+        self.db.pending_changes = []
         self.db.set_modified(False)
 
     def file_exists(self):
@@ -177,7 +202,7 @@ class WalletStorage(Logger):
 
     def _init_encryption_version(self):
         try:
-            magic = base64.b64decode(self.raw)[0:4]
+            magic = self.raw[0:4]
             if magic == b'BIE1':
                 return StorageEncryptionVersion.USER_PASSWORD
             elif magic == b'BIE2':
@@ -205,24 +230,59 @@ class WalletStorage(Logger):
     def decrypt(self, password):
         ec_key = self.get_eckey_from_password(password)
         if self.raw:
+            encrypted = self.raw
             enc_magic = self._get_encryption_magic()
-            s = zlib.decompress(ec_key.decrypt_message(self.raw, enc_magic))
+            self.key_e, self.key_m, iv, ciphertext, mac = ec_key.decode_encrypted(encrypted, enc_magic)
+            self.mac = hmac.new(self.key_m, encrypted[:-32-16], hashlib.sha256)
+            m2 = self.mac.copy()
+            assert ciphertext[-16:] == encrypted[-32-16:-32]
+            m2.update(ciphertext[-16:])
+            if m2.digest() != mac:
+                raise InvalidPassword()
+            last_block = ciphertext[-16:]
+            s = aes_decrypt_with_iv(self.key_e, iv, ciphertext)
+            iv2 = iv if len(ciphertext)==16 else ciphertext[-32:-16]
+            last_blob = aes_decrypt_with_iv(self.key_e, iv2, last_block)
+            assert last_block == aes_encrypt_with_iv(self.key_e, iv2, last_blob)
+            #assert last_blob
+            self.iv = iv2
+            self.last_blob = last_blob
         else:
             s = None
         self.pubkey = ec_key.get_public_key_hex()
         s = s.decode('utf8')
         self.db = JsonDB(s, manual_upgrades=True)
+        self._write()
         self.load_plugins()
 
-    def encrypt_before_writing(self, plaintext: str) -> str:
-        s = plaintext
+    def encrypt_for_write(self, plaintext: str) -> str:
+        s = bytes(plaintext, 'utf8')
         if self.pubkey:
-            s = bytes(s, 'utf8')
-            c = zlib.compress(s)
             enc_magic = self._get_encryption_magic()
             public_key = ecc.ECPubkey(bfh(self.pubkey))
-            s = public_key.encrypt_message(c, enc_magic)
-            s = s.decode('utf8')
+            encrypted, ciphertext, key_e, key_m, iv, mac = public_key._encrypt_message(s, enc_magic)
+            s = encrypted + mac
+            # save mac, last_blob, key_e, key_m, and iv, for subsequent encr
+            self.key_e = key_e
+            self.key_m = key_m
+            self.iv = ciphertext[-32:-16]
+            self.last_blob = aes_decrypt_with_iv(self.key_e, self.iv, ciphertext[-16:])
+            self.mac = hmac.new(self.key_m, encrypted[:-16], hashlib.sha256)
+        return s
+
+    def encrypt_for_append(self, plaintext: str) -> str:
+        s = bytes(plaintext, 'utf8')
+        if self.pubkey:
+            enc_magic = self._get_encryption_magic()
+            ciphertext = aes_encrypt_with_iv(self.key_e, self.iv, self.last_blob + s)
+            self.iv = self.iv if len(ciphertext)==16 else ciphertext[-32:-16]
+            self.last_blob = aes_decrypt_with_iv(self.key_e, self.iv, ciphertext[-16:])
+            # self.mac does not include the last block
+            self.mac.update(ciphertext[0:-16])
+            m2 = self.mac.copy()
+            m2.update(ciphertext[-16:])
+            mac = m2.digest()
+            s = ciphertext + mac
         return s
 
     def check_password(self, password):
@@ -259,7 +319,7 @@ class WalletStorage(Logger):
 
     def upgrade(self):
         self.db.upgrade()
-        self.write()
+        self._write()
 
     def requires_split(self):
         return self.db.requires_split()

@@ -29,6 +29,7 @@ import copy
 import threading
 from collections import defaultdict
 from typing import Dict, Optional, List, Tuple, Set, Iterable, NamedTuple, Sequence
+import jsonpatch
 
 from . import util, bitcoin
 from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh
@@ -40,7 +41,7 @@ from .logging import Logger
 
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 22     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 23     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
@@ -53,12 +54,44 @@ class TxFeesValue(NamedTuple):
     num_inputs: Optional[int] = None
 
 
+class StorageDict(dict):
+
+    def __init__(self, db, path, data):
+        #self.update(data)
+        self.db = db
+        self.path = path
+        for k, v in list(data.items()):
+            # recursively convert dicts to storagedict
+            self.__setitem__(k, v, patch=False)
+
+    def __setitem__(self, key, value, patch=True):
+        is_dict = type(value) is dict
+        is_new = key not in self
+        # early return to prevent unnecessary disk writes
+        if not is_new and self[key] == value:
+            return
+        # convert dict to StorageDict
+        v = StorageDict(self.db, self.path+'/'+key, value) if is_dict else value
+        dict.__setitem__(self, key, v)
+        if patch:
+            path = self.path + '/' + str(key)
+            op = 'add' if is_new else 'replace'
+            self.db.add_patch({'op': op, 'path': path, 'value': value})
+
+    def __delitem__(self, key):
+        path = self.path + '/' + str(key)
+        self.db.add_patch({'op': 'remove', 'path': path})
+        return dict.__delitem__(self, key)
+
+
+
 class JsonDB(Logger):
 
     def __init__(self, raw, *, manual_upgrades):
         Logger.__init__(self)
         self.lock = threading.RLock()
         self.data = {}
+        self.pending_changes = []
         self._modified = False
         self.manual_upgrades = manual_upgrades
         self._called_after_upgrade_tasks = False
@@ -93,9 +126,19 @@ class JsonDB(Logger):
         v = self.data.get(key)
         if v is None:
             v = default
-        else:
-            v = copy.deepcopy(v)
+        #else:
+        #    v = copy.deepcopy(v)
         return v
+
+    def get_dict(self, path):
+        d = self.data
+        keys = path.split('/') if path else []
+        # reach desired level
+        for key in keys:
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+        return d
 
     @modifier
     def put(self, key, value):
@@ -114,6 +157,9 @@ class JsonDB(Logger):
             return True
         return False
 
+    def add_patch(self, patch):
+        self.pending_changes.append(json.dumps(patch, cls=JsonDBJsonEncoder))
+
     def commit(self):
         pass
 
@@ -121,9 +167,11 @@ class JsonDB(Logger):
     def dump(self):
         return json.dumps(self.data, indent=4, sort_keys=True, cls=JsonDBJsonEncoder)
 
+    @profiler
     def load_data(self, s):
         try:
-            self.data = json.loads(s)
+            data = json.loads('[' + s + ']')
+            self.data, patches = data[0], data[1:]
         except:
             try:
                 d = ast.literal_eval(s)
@@ -131,6 +179,7 @@ class JsonDB(Logger):
             except Exception as e:
                 raise IOError("Cannot read wallet file")
             self.data = {}
+            patches = []
             for key, value in d.items():
                 try:
                     json.dumps(key)
@@ -141,12 +190,18 @@ class JsonDB(Logger):
                 self.data[key] = value
         if not isinstance(self.data, dict):
             raise WalletFileException("Malformed wallet file (not dict)")
+        # apply patches
+        self.logger.info('found %d patches'%len(patches))
+        patch = jsonpatch.JsonPatch(patches)
+        self.data = patch.apply(self.data)
+        self.set_modified(True)
 
         if not self.manual_upgrades and self.requires_split():
             raise WalletFileException("This wallet has multiple accounts and must be split")
 
         if not self.requires_upgrade():
             self._after_upgrade_tasks()
+            assert self.pending_changes == []
         elif not self.manual_upgrades:
             self.upgrade()
 
@@ -216,6 +271,7 @@ class JsonDB(Logger):
         self._convert_version_20()
         self._convert_version_21()
         self._convert_version_22()
+        self._convert_version_23()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
         self._after_upgrade_tasks()
@@ -227,10 +283,9 @@ class JsonDB(Logger):
     def _convert_wallet_type(self):
         if not self._is_upgrade_method_needed(0, 13):
             return
-
         wallet_type = self.get('wallet_type')
         if wallet_type == 'btchip': wallet_type = 'ledger'
-        if self.get('keystore') or self.get('x1/') or wallet_type=='imported':
+        if self.get('keystore') or self.get('x1/') or self.get('x1') or wallet_type=='imported':
             return False
         assert not self.requires_split()
         seed_version = self.get_seed_version()
@@ -501,19 +556,61 @@ class JsonDB(Logger):
         # construct prevouts_by_scripthash
         if not self._is_upgrade_method_needed(21, 21):
             return
-
         from .bitcoin import script_to_scripthash
         transactions = self.get('transactions', {})  # txid -> raw_tx
-        prevouts_by_scripthash = defaultdict(list)
+        prevouts_by_scripthash = {}
         for txid, raw_tx in transactions.items():
             tx = Transaction(raw_tx)
             for idx, txout in enumerate(tx.outputs()):
                 outpoint = f"{txid}:{idx}"
                 scripthash = script_to_scripthash(txout.scriptpubkey.hex())
-                prevouts_by_scripthash[scripthash].append((outpoint, txout.value))
+                if scripthash not in prevouts_by_scripthash:
+                    prevouts_by_scripthash[scripthash] = set()
+                prevouts_by_scripthash[scripthash].add((outpoint, txout.value))
         self.put('prevouts_by_scripthash', prevouts_by_scripthash)
-
         self.put('seed_version', 22)
+
+    def _convert_version_23(self):
+        if not self._is_upgrade_method_needed(22, 22):
+            return
+
+        wallet_type = self.get('wallet_type')
+        if wallet_type != 'imported':
+            addresses = self.get('addresses', {})
+            self.data['addresses'] = {}
+            receiving_addresses = {}
+            for i, addr in enumerate(addresses.get('receiving', [])):
+                receiving_addresses[str(i)] = addr
+            self.data['addresses']['receiving'] = receiving_addresses
+            change_addresses = {}
+            for i, addr in enumerate(addresses.get('change', [])):
+                change_addresses[str(i)] = addr
+            self.data['addresses']['change'] = change_addresses
+        # convert txi & txo
+        txi = self.get('txi', {})
+        for tx_hash, d in txi.items():
+            d2 = {}
+            for addr, l in d.items():
+                d2[addr] = {}
+                for ser, v in l:
+                    d2[addr][ser] = v
+            txi[tx_hash] = d2
+        self.data['txi'] = txi
+        txo = self.get('txo', {})
+        for tx_hash, d in txo.items():
+            d2 = {}
+            for addr, l in d.items():
+                d2[addr] = {}
+                for n, v, cb in l:
+                    d2[addr][str(n)] = (v, cb)
+            txo[tx_hash] = d2
+        self.data['txo'] = txo
+        # convert keystore names
+        for key in list(self.data.keys()):
+            if key.endswith('/'):
+                self.data[key[:-1]] = self.data.pop(key)
+
+        self.data['seed_version'] = 23
 
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):
@@ -606,12 +703,14 @@ class JsonDB(Logger):
     @locked
     def get_txi_addr(self, tx_hash, address) -> Iterable[Tuple[str, int]]:
         """Returns an iterable of (prev_outpoint, value)."""
-        return self.txi.get(tx_hash, {}).get(address, []).copy()
+        d = self.txi.get(tx_hash, {}).get(address, {})
+        return list(d.items())
 
     @locked
     def get_txo_addr(self, tx_hash, address) -> Iterable[Tuple[int, int, bool]]:
         """Returns an iterable of (output_index, value, is_coinbase)."""
-        return self.txo.get(tx_hash, {}).get(address, []).copy()
+        d = self.txo.get(tx_hash, {}).get(address, {})
+        return [(int(n), v, cb) for (n, (v, cb)) in d.items()]
 
     @modifier
     def add_txi_addr(self, tx_hash, addr, ser, v):
@@ -619,9 +718,8 @@ class JsonDB(Logger):
             self.txi[tx_hash] = {}
         d = self.txi[tx_hash]
         if addr not in d:
-            # note that as this is a set, we can ignore "duplicates"
-            d[addr] = set()
-        d[addr].add((ser, v))
+            d[addr] = {}
+        d[addr][ser] = v
 
     @modifier
     def add_txo_addr(self, tx_hash, addr, n, v, is_coinbase):
@@ -629,9 +727,8 @@ class JsonDB(Logger):
             self.txo[tx_hash] = {}
         d = self.txo[tx_hash]
         if addr not in d:
-            # note that as this is a set, we can ignore "duplicates"
-            d[addr] = set()
-        d[addr].add((n, v, is_coinbase))
+            d[addr] = {}
+        d[addr][n] = (v, is_coinbase)
 
     @locked
     def list_txi(self):
@@ -812,14 +909,6 @@ class JsonDB(Logger):
         self.tx_fees.pop(txid, None)
 
     @locked
-    def get_data_ref(self, name):
-        # Warning: interacts un-intuitively with 'put': certain parts
-        # of 'data' will have pointers saved as separate variables.
-        if name not in self.data:
-            self.data[name] = {}
-        return self.data[name]
-
-    @locked
     def num_change_addresses(self):
         return len(self.change_addresses)
 
@@ -830,22 +919,34 @@ class JsonDB(Logger):
     @locked
     def get_change_addresses(self, *, slice_start=None, slice_stop=None):
         # note: slicing makes a shallow copy
-        return self.change_addresses[slice_start:slice_stop]
+        n = len(self.change_addresses)
+        slice_start = slice_start or 0
+        if slice_start < 0: slice_start = slice_start % n
+        slice_stop = slice_stop or n
+        if slice_stop < 0: slice_stop = slice_stop % n
+        return [self.change_addresses[str(i)] for i in range(slice_start, slice_stop)]
 
     @locked
     def get_receiving_addresses(self, *, slice_start=None, slice_stop=None):
         # note: slicing makes a shallow copy
-        return self.receiving_addresses[slice_start:slice_stop]
+        n = len(self.receiving_addresses)
+        slice_start = slice_start or 0
+        if slice_start < 0: slice_start = slice_start % n
+        slice_stop = slice_stop or n
+        if slice_stop < 0: slice_stop = slice_stop % n
+        return [self.receiving_addresses[str(i)] for i in range(slice_start, slice_stop)]
 
     @modifier
     def add_change_address(self, addr):
-        self._addr_to_addr_index[addr] = (1, len(self.change_addresses))
-        self.change_addresses.append(addr)
+        n = len(self.change_addresses)
+        self._addr_to_addr_index[addr] = (1, n)
+        self.change_addresses[str(n)] = addr
 
     @modifier
     def add_receiving_address(self, addr):
-        self._addr_to_addr_index[addr] = (0, len(self.receiving_addresses))
-        self.receiving_addresses.append(addr)
+        n = len(self.receiving_addresses)
+        self._addr_to_addr_index[addr] = (0, n)
+        self.receiving_addresses[str(n)] = addr
 
     @locked
     def get_address_index(self, address) -> Optional[Sequence[int]]:
@@ -874,46 +975,38 @@ class JsonDB(Logger):
     def load_addresses(self, wallet_type):
         """ called from Abstract_Wallet.__init__ """
         if wallet_type == 'imported':
-            self.imported_addresses = self.get_data_ref('addresses')
+            self.imported_addresses = self.get_dict('addresses')
         else:
-            self.get_data_ref('addresses')
-            for name in ['receiving', 'change']:
-                if name not in self.data['addresses']:
-                    self.data['addresses'][name] = []
-            self.change_addresses = self.data['addresses']['change']
-            self.receiving_addresses = self.data['addresses']['receiving']
+            self.change_addresses = self.get_dict('addresses/change')
+            self.receiving_addresses = self.get_dict('addresses/receiving')
             self._addr_to_addr_index = {}  # type: Dict[str, Sequence[int]]  # key: address, value: (is_change, index)
-            for i, addr in enumerate(self.receiving_addresses):
-                self._addr_to_addr_index[addr] = (0, i)
-            for i, addr in enumerate(self.change_addresses):
-                self._addr_to_addr_index[addr] = (1, i)
+            for i, addr in self.receiving_addresses.items():
+                self._addr_to_addr_index[addr] = (0, int(i))
+            for i, addr in self.change_addresses.items():
+                self._addr_to_addr_index[addr] = (1, int(i))
 
     @profiler
     def _load_transactions(self):
+        self.data = StorageDict(self, '', self.data)
         # references in self.data
         # TODO make all these private
         # txid -> address -> set of (prev_outpoint, value)
-        self.txi = self.get_data_ref('txi')  # type: Dict[str, Dict[str, Set[Tuple[str, int]]]]
+        self.txi = self.get_dict('txi')                          # type: Dict[str, Dict[str, Set[Tuple[str, int]]]]
         # txid -> address -> set of (output_index, value, is_coinbase)
-        self.txo = self.get_data_ref('txo')  # type: Dict[str, Dict[str, Set[Tuple[int, int, bool]]]]
-        self.transactions = self.get_data_ref('transactions')   # type: Dict[str, Transaction]
-        self.spent_outpoints = self.get_data_ref('spent_outpoints')  # txid -> output_index -> next_txid
-        self.history = self.get_data_ref('addr_history')  # address -> list of (txid, height)
-        self.verified_tx = self.get_data_ref('verified_tx3')  # txid -> (height, timestamp, txpos, header_hash)
-        self.tx_fees = self.get_data_ref('tx_fees')  # type: Dict[str, TxFeesValue]
+        self.txo = self.get_dict('txo')                          # type: Dict[str, Dict[str, Set[Tuple[int, int, bool]]]]
+        self.transactions = self.get_dict('transactions')        # type: Dict[str, Transaction]
+        self.spent_outpoints = self.get_dict('spent_outpoints')  # txid -> output_index -> next_txid
+        self.history = self.get_dict('addr_history')             # address -> list of (txid, height)
+        self.verified_tx = self.get_dict('verified_tx3')         # txid -> (height, timestamp, txpos, header_hash)
+        self.tx_fees = self.get_dict('tx_fees')                  # type: Dict[str, TxFeesValue]
         # scripthash -> set of (outpoint, value)
-        self._prevouts_by_scripthash = self.get_data_ref('prevouts_by_scripthash')  # type: Dict[str, Set[Tuple[str, int]]]
+        self._prevouts_by_scripthash = self.get_dict('prevouts_by_scripthash')  # type: Dict[str, Set[Tuple[str, int]]]
         # convert raw hex transactions to Transaction objects
         for tx_hash, raw_tx in self.transactions.items():
-            self.transactions[tx_hash] = Transaction(raw_tx)
-        # convert txi, txo: list to set
-        for t in self.txi, self.txo:
-            for d in t.values():
-                for addr, lst in d.items():
-                    d[addr] = set([tuple(x) for x in lst])
+            self.transactions.__setitem__(tx_hash, Transaction(raw_tx), patch=False)
         # convert prevouts_by_scripthash: list to set, list to tuple
         for scripthash, lst in self._prevouts_by_scripthash.items():
-            self._prevouts_by_scripthash[scripthash] = {(prevout, value) for prevout, value in lst}
+            self._prevouts_by_scripthash.__setitem__(scripthash, {(prevout, value) for prevout, value in lst}, patch=False)
         # remove unreferenced tx
         for tx_hash in list(self.transactions.keys()):
             if not self.get_txi_addresses(tx_hash) and not self.get_txo_addresses(tx_hash):
@@ -928,7 +1021,7 @@ class JsonDB(Logger):
                     d.pop(prevout_n)
         # convert tx_fees tuples to NamedTuples
         for tx_hash, tuple_ in self.tx_fees.items():
-            self.tx_fees[tx_hash] = TxFeesValue(*tuple_)
+            self.tx_fees.__setitem__(tx_hash, TxFeesValue(*tuple_), patch=False)
 
     @modifier
     def clear_history(self):

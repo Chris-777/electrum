@@ -238,12 +238,12 @@ class Abstract_Wallet(AddressSynchronizer):
         # saved fields
         self.use_change            = storage.get('use_change', True)
         self.multiple_change       = storage.get('multiple_change', False)
-        self.labels                = storage.get('labels', {})
+        self.labels                = storage.db.get_dict('labels')
         self.frozen_addresses      = set(storage.get('frozen_addresses', []))
         self.frozen_coins          = set(storage.get('frozen_coins', []))  # set of txid:vout strings
-        self.fiat_value            = storage.get('fiat_value', {})
-        self.receive_requests      = storage.get('payment_requests', {})
-        self.invoices              = storage.get('invoices', {})
+        self.fiat_value            = storage.db.get_dict('fiat_value')
+        self.receive_requests      = storage.db.get_dict('payment_requests')
+        self.invoices              = storage.db.get_dict('invoices')
         # convert invoices
         # TODO invoices being these contextual dicts even internally,
         #      where certain keys are only present depending on values of other keys...
@@ -368,7 +368,8 @@ class Abstract_Wallet(AddressSynchronizer):
                 changed = True
         if changed:
             run_hook('set_label', self, name, text)
-            self.storage.put('labels', self.labels)
+            #self.storage.put('labels', self.labels)
+            self.storage.write()
         return changed
 
     def set_fiat_value(self, txid, ccy, text, fx, value_sat):
@@ -400,7 +401,6 @@ class Abstract_Wallet(AddressSynchronizer):
             if ccy not in self.fiat_value:
                 self.fiat_value[ccy] = {}
             self.fiat_value[ccy][txid] = text
-        self.storage.put('fiat_value', self.fiat_value)
         return reset
 
     def get_fiat_value(self, txid, ccy):
@@ -623,12 +623,10 @@ class Abstract_Wallet(AddressSynchronizer):
         else:
             raise Exception('Unsupported invoice type')
         self.invoices[key] = invoice
-        self.storage.put('invoices', self.invoices)
         self.storage.write()
 
     def clear_invoices(self):
         self.invoices = {}
-        self.storage.put('invoices', self.invoices)
         self.storage.write()
 
     def get_invoices(self):
@@ -1599,7 +1597,6 @@ class Abstract_Wallet(AddressSynchronizer):
         req['name'] = pr.pki_data
         req['sig'] = bh2u(pr.signature)
         self.receive_requests[key] = req
-        self.storage.put('payment_requests', self.receive_requests)
 
     def add_payment_request(self, req):
         if req['type'] == PR_TYPE_ONCHAIN:
@@ -1617,7 +1614,6 @@ class Abstract_Wallet(AddressSynchronizer):
             raise Exception('Unknown request type')
         amount = req.get('amount')
         self.receive_requests[key] = req
-        self.storage.put('payment_requests', self.receive_requests)
         self.set_label(key, message) # should be a default label
         return req
 
@@ -1632,7 +1628,6 @@ class Abstract_Wallet(AddressSynchronizer):
         """ lightning or on-chain """
         if key in self.invoices:
             self.invoices.pop(key)
-            self.storage.put('invoices', self.invoices)
         elif self.lnworker:
             self.lnworker.delete_payment(key)
 
@@ -1640,7 +1635,6 @@ class Abstract_Wallet(AddressSynchronizer):
         if addr not in self.receive_requests:
             return False
         self.receive_requests.pop(addr)
-        self.storage.put('payment_requests', self.receive_requests)
         return True
 
     def get_sorted_requests(self):
@@ -1720,7 +1714,8 @@ class Abstract_Wallet(AddressSynchronizer):
         self._update_password_for_keystore(old_pw, new_pw)
         encrypt_keystore = self.can_have_keystore_encryption()
         self.storage.set_keystore_encryption(bool(new_pw) and encrypt_keystore)
-        self.storage.write()
+        # rewrite the whole file after password upddate
+        self.storage._write()
 
     def sign_message(self, address, message, password):
         index = self.get_address_index(address)
@@ -1852,6 +1847,7 @@ class Imported_Wallet(Simple_Wallet):
         self.keystore = load_keystore(self.storage, 'keystore') if self.storage.get('keystore') else None
 
     def save_keystore(self):
+        #print('warning: save_keystore is deprecated')
         self.storage.put('keystore', self.keystore.dump())
 
     def can_import_address(self):
@@ -2272,9 +2268,9 @@ class Multisig_Wallet(Deterministic_Wallet):
     def load_keystore(self):
         self.keystores = {}
         for i in range(self.n):
-            name = 'x%d/'%(i+1)
+            name = 'x%d'%(i+1)
             self.keystores[name] = load_keystore(self.storage, name)
-        self.keystore = self.keystores['x1/']
+        self.keystore = self.keystores['x1']
         xtype = bip32.xpub_type(self.keystore.xpub)
         self.txin_type = 'p2sh' if xtype == 'standard' else xtype
 
@@ -2283,7 +2279,7 @@ class Multisig_Wallet(Deterministic_Wallet):
             self.storage.put(name, k.dump())
 
     def get_keystore(self):
-        return self.keystores.get('x1/')
+        return self.keystores.get('x1')
 
     def get_keystores(self):
         return [self.keystores[i] for i in sorted(self.keystores.keys())]
@@ -2402,6 +2398,8 @@ def restore_wallet_from_text(text, *, path, config: SimpleConfig,
     elif keystore.is_private_key_list(text, allow_spaces_inside_key=False):
         k = keystore.Imported_KeyStore({})
         storage.put('keystore', k.dump())
+
+        # we are reusing storage...
         wallet = Imported_Wallet(storage, config=config)
         keys = keystore.get_private_keys(text, allow_spaces_inside_key=False)
         good_inputs, bad_inputs = wallet.import_private_keys(keys, None, write_to_disk=False)

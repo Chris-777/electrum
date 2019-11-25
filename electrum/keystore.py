@@ -218,7 +218,8 @@ class Imported_KeyStore(Software_KeyStore):
 
     def __init__(self, d):
         Software_KeyStore.__init__(self, d)
-        self.keypairs = d.get('keypairs', {})
+        # convert StorageDict to dict
+        self.keypairs = dict(d.get('keypairs', {}))
 
     def is_deterministic(self):
         return False
@@ -810,6 +811,7 @@ def hardware_keystore(d) -> Hardware_KeyStore:
                               f'hw_keystores: {list(hw_keystores)}')
 
 def load_keystore(storage, name) -> KeyStore:
+    # fixme: this returns a StorageDict
     d = storage.get(name, {})
     t = d.get('type')
     if not t:

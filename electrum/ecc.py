@@ -285,7 +285,7 @@ class ECPubkey(object):
         verifying_key = _MyVerifyingKey.from_public_point(ecdsa_point, curve=SECP256k1)
         verifying_key.verify_digest(sig_string, msg_hash, sigdecode=ecdsa.util.sigdecode_string)
 
-    def encrypt_message(self, message: bytes, magic: bytes = b'BIE1') -> bytes:
+    def _encrypt_message(self, message: bytes, magic: bytes = b'BIE1') -> bytes:
         """
         ECIES encryption/decryption methods; AES-128-CBC with PKCS7 is used as the cipher; hmac-sha256 is used as the mac
         """
@@ -300,6 +300,10 @@ class ECPubkey(object):
         encrypted = magic + ephemeral_pubkey + ciphertext
         mac = hmac_oneshot(key_m, encrypted, hashlib.sha256)
 
+        return encrypted, ciphertext, key_e, key_m, iv, mac
+
+    def encrypt_message(self, message: bytes, magic: bytes = b'BIE1') -> bytes:
+        encrypted, ciphertext, key_e, key_m, iv, mac = self._encrypt_message(message, magic)
         return base64.b64encode(encrypted + mac)
 
     @classmethod
@@ -445,8 +449,7 @@ class ECPrivkey(ECPubkey):
         sig65, recid = bruteforce_recid(sig_string)
         return sig65
 
-    def decrypt_message(self, encrypted: Union[str, bytes], magic: bytes=b'BIE1') -> bytes:
-        encrypted = base64.b64decode(encrypted)  # type: bytes
+    def decode_encrypted(self, encrypted: bytes, magic: bytes=b'BIE1') -> bytes:
         if len(encrypted) < 85:
             raise Exception('invalid ciphertext: length')
         magic_found = encrypted[:4]
@@ -465,6 +468,11 @@ class ECPrivkey(ECPubkey):
         ecdh_key = (ephemeral_pubkey * self.secret_scalar).get_public_key_bytes(compressed=True)
         key = hashlib.sha512(ecdh_key).digest()
         iv, key_e, key_m = key[0:16], key[16:32], key[32:]
+        return key_e, key_m, iv, ciphertext, mac
+
+    def decrypt_message(self, encrypted: Union[str, bytes], magic: bytes=b'BIE1') -> bytes:
+        encrypted = base64.b64decode(encrypted)  # type: bytes
+        key_e, key_m, iv, ciphertext, mac = self.decode_encrypted(encrypted, magic)
         if mac != hmac_oneshot(key_m, encrypted[:-32], hashlib.sha256):
             raise InvalidPassword()
         return aes_decrypt_with_iv(key_e, iv, ciphertext)

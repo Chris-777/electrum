@@ -341,8 +341,8 @@ class LNWallet(LNWorker):
         LNWorker.__init__(self, xprv)
         self.ln_keystore = keystore.from_xprv(xprv)
         self.localfeatures |= LnLocalFeatures.OPTION_DATA_LOSS_PROTECT_REQ
-        self.payments = self.storage.get('lightning_payments', {})        # RHASH -> amount, direction, is_paid
-        self.preimages = self.storage.get('lightning_preimages', {})      # RHASH -> preimage
+        self.payments = self.storage.db.get_dict('lightning_payments')     # RHASH -> amount, direction, is_paid
+        self.preimages = self.storage.db.get_dict('lightning_preimages')   # RHASH -> preimage
         self.sweep_address = wallet.get_receiving_address()
         self.lock = threading.RLock()
         self.logs = defaultdict(list)
@@ -353,7 +353,7 @@ class LNWallet(LNWorker):
             c = Channel(x, sweep_address=self.sweep_address, lnworker=self)
             self.channels[c.channel_id] = c
         # timestamps of opening and closing transactions
-        self.channel_timestamps = self.storage.get('lightning_channel_timestamps', {})
+        self.channel_timestamps = self.storage.db.get_dict('lightning_channel_timestamps')
         self.pending_payments = defaultdict(asyncio.Future)
 
     @ignore_exceptions
@@ -669,7 +669,6 @@ class LNWallet(LNWorker):
             if chan.short_channel_id:
                 chan.set_state(channel_states.FUNDED)
                 self.channel_timestamps[bh2u(chan.channel_id)] = chan.funding_outpoint.txid, funding_height.height, funding_height.timestamp, None, None, None
-                self.storage.put('lightning_channel_timestamps', self.channel_timestamps)
 
         if chan.get_state() == channel_states.FUNDED:
             peer = self.peers.get(chan.node_id)
@@ -703,7 +702,6 @@ class LNWallet(LNWorker):
 
         # fixme: this is wasteful
         self.channel_timestamps[bh2u(chan.channel_id)] = funding_txid, funding_height.height, funding_height.timestamp, closing_txid, closing_height.height, closing_height.timestamp
-        self.storage.put('lightning_channel_timestamps', self.channel_timestamps)
 
         # remove from channel_db
         if chan.short_channel_id is not None:
@@ -1114,7 +1112,6 @@ class LNWallet(LNWorker):
     def save_preimage(self, payment_hash: bytes, preimage: bytes):
         assert sha256(preimage) == payment_hash
         self.preimages[bh2u(payment_hash)] = bh2u(preimage)
-        self.storage.put('lightning_preimages', self.preimages)
         self.storage.write()
 
     def get_preimage(self, payment_hash: bytes) -> bytes:
@@ -1133,7 +1130,6 @@ class LNWallet(LNWorker):
         assert info.status in [PR_PAID, PR_UNPAID, PR_INFLIGHT]
         with self.lock:
             self.payments[key] = info.amount, info.direction, info.status
-        self.storage.put('lightning_payments', self.payments)
         self.storage.write()
 
     def get_payment_status(self, payment_hash):
@@ -1219,7 +1215,6 @@ class LNWallet(LNWorker):
                 del self.payments[payment_hash_hex]
         except KeyError:
             return
-        self.storage.put('lightning_payments', self.payments)
         self.storage.write()
 
     def get_balance(self):

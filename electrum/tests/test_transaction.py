@@ -838,8 +838,8 @@ class TestLegacyPartialTxFormat(TestCaseForTestnet):
         ks1 = keystore.from_xprv(xprv1)
         ks2 = keystore.from_xprv(xprv2)
         long_user_id, short_id = trustedcoin.get_user_id(
-            {'x1/': {'xpub': xpub1},
-             'x2/': {'xpub': xpub2}})
+            {'x1': {'xpub': xpub1},
+             'x2': {'xpub': xpub2}})
         xtype = bip32.xpub_type(xpub1)
         xpub3 = trustedcoin.make_xpub(trustedcoin.get_signing_xpub(xtype), long_user_id)
         ks3 = keystore.from_xpub(xpub3)
@@ -861,8 +861,8 @@ class TestLegacyPartialTxFormat(TestCaseForTestnet):
         ks1 = keystore.from_xprv(xprv1)
         ks2 = keystore.from_xprv(xprv2)
         long_user_id, short_id = trustedcoin.get_user_id(
-            {'x1/': {'xpub': xpub1},
-             'x2/': {'xpub': xpub2}})
+            {'x1': {'xpub': xpub1},
+             'x2': {'xpub': xpub2}})
         xtype = bip32.xpub_type(xpub1)
         xpub3 = trustedcoin.make_xpub(trustedcoin.get_signing_xpub(xtype), long_user_id)
         ks3 = keystore.from_xpub(xpub3)

@@ -66,7 +66,7 @@ class HandlerTwoFactor(QObject, Logger):
             return
         if wallet.can_sign_without_server():
             return
-        if not wallet.keystores['x3/'].get_tx_derivations(tx):
+        if not wallet.keystores['x3'].get_tx_derivations(tx):
             self.logger.info("twofactor: xpub3 not needed")
             return
         window = self.window.top_level_window()
