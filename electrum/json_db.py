@@ -126,8 +126,6 @@ class JsonDB(Logger):
         v = self.data.get(key)
         if v is None:
             v = default
-        #else:
-        #    v = copy.deepcopy(v)
         return v
 
     def get_dict(self, path):

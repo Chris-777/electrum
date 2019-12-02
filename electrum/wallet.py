@@ -638,7 +638,8 @@ class Abstract_Wallet(AddressSynchronizer):
     def get_invoice(self, key):
         if key not in self.invoices:
             return
-        item = copy.copy(self.invoices[key])
+        # convert StorageDict to dict
+        item = dict(self.invoices[key])
         request_type = item.get('type')
         if request_type == PR_TYPE_ONCHAIN:
             item['status'] = PR_PAID if self._is_onchain_invoice_paid(item)[0] else PR_UNPAID
@@ -1540,7 +1541,8 @@ class Abstract_Wallet(AddressSynchronizer):
         req = self.receive_requests.get(key)
         if not req:
             return
-        req = copy.copy(req)
+        # convert StorageDict to dict
+        req = dict(req)
         _type = req.get('type')
         if _type == PR_TYPE_ONCHAIN:
             addr = req['address']
