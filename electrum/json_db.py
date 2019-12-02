@@ -32,9 +32,9 @@ from typing import Dict, Optional, List, Tuple, Set, Iterable, NamedTuple, Seque
 import jsonpatch
 
 from . import util, bitcoin
-from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh
+from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh, PR_TYPE_ONCHAIN
 from .keystore import bip44_derivation
-from .transaction import Transaction, TxOutpoint
+from .transaction import Transaction, TxOutpoint, PartialTxOutput
 from .logging import Logger
 
 # seed_version is now used for the version of the wallet file
@@ -1020,6 +1020,16 @@ class JsonDB(Logger):
         # convert tx_fees tuples to NamedTuples
         for tx_hash, tuple_ in self.tx_fees.items():
             self.tx_fees.__setitem__(tx_hash, TxFeesValue(*tuple_), patch=False)
+        # convert invoices
+        # TODO invoices being these contextual dicts even internally,
+        #      where certain keys are only present depending on values of other keys...
+        #      it's horrible. we need to change this, at least for the internal representation,
+        #      to something that can be typed.
+        self.invoices = self.get_dict('invoices')
+        for invoice_key, invoice in self.invoices.items():
+            if invoice.get('type') == PR_TYPE_ONCHAIN:
+                outputs = [PartialTxOutput.from_legacy_tuple(*output) for output in invoice.get('outputs')]
+                invoice.__setitem__('outputs', outputs, patch=False)
 
     @modifier
     def clear_history(self):

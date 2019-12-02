@@ -244,15 +244,7 @@ class Abstract_Wallet(AddressSynchronizer):
         self.fiat_value            = storage.db.get_dict('fiat_value')
         self.receive_requests      = storage.db.get_dict('payment_requests')
         self.invoices              = storage.db.get_dict('invoices')
-        # convert invoices
-        # TODO invoices being these contextual dicts even internally,
-        #      where certain keys are only present depending on values of other keys...
-        #      it's horrible. we need to change this, at least for the internal representation,
-        #      to something that can be typed.
-        for invoice_key, invoice in self.invoices.items():
-            if invoice.get('type') == PR_TYPE_ONCHAIN:
-                outputs = [PartialTxOutput.from_legacy_tuple(*output) for output in invoice.get('outputs')]
-                invoice['outputs'] = outputs
+
         self._prepare_onchain_invoice_paid_detection()
         self.calc_unused_change_addresses()
         # save wallet type the first time
