@@ -13,3 +13,4 @@ pycryptodomex>=3.7
 jsonrpcserver
 jsonrpcclient
 jsonpatch
+attrs

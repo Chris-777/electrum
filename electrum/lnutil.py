@@ -7,6 +7,7 @@ import json
 from collections import namedtuple
 from typing import NamedTuple, List, Tuple, Mapping, Optional, TYPE_CHECKING, Union, Dict, Set
 import re
+import attr
 
 from aiorpcx import NetAddress
 
@@ -35,74 +36,91 @@ LN_MAX_FUNDING_SAT = pow(2, 24) - 1
 def ln_dummy_address():
     return redeem_script_to_address('p2wsh', '')
 
-class Keypair(NamedTuple):
-    pubkey: bytes
-    privkey: bytes
+@attr.s
+class Keypair:
+    pubkey = attr.ib(bytes)
+    privkey = attr.ib(bytes)
+    def to_json(self):
+        return vars(self)
+
+@attr.s
+class OnlyPubkeyKeypair:
+    pubkey = attr.ib(bytes)
+    def to_json(self):
+        return vars(self)
 
 
-class OnlyPubkeyKeypair(NamedTuple):
-    pubkey: bytes
+class StoredX:
+    # ancestor so that we can call super()
+    pass
+
+class StoredAttr(StoredX):
+    db = None
+    path = None
+
+    def __setattr__(self, key, value):
+        super().__setattr__(key, value)
+        if self.db and key not in ['path', 'db']:
+            path = self.path + '/' + str(key)
+            self.db.add_patch({'op': 'replace', 'path': path, 'value': value})
+
+    def to_json(self):
+        # dict() copies the object
+        d = dict(vars(self))
+        d.pop('path', None)
+        d.pop('db', None)
+        return d
+
+    def set_parent(self, parent, key):
+        self.db = parent.db
+        self.path = parent.path + '/'+ key
 
 
-# NamedTuples cannot subclass NamedTuples :'(   https://github.com/python/typing/issues/427
-class LocalConfig(NamedTuple):
-    # shared channel config fields (DUPLICATED code!!)
-    payment_basepoint: 'Keypair'
-    multisig_key: 'Keypair'
-    htlc_basepoint: 'Keypair'
-    delayed_basepoint: 'Keypair'
-    revocation_basepoint: 'Keypair'
-    to_self_delay: int
-    dust_limit_sat: int
-    max_htlc_value_in_flight_msat: int
-    max_accepted_htlcs: int
-    initial_msat: int
-    reserve_sat: int
+@attr.s
+class Config(StoredAttr):
+    # shared channel config fields
+    payment_basepoint = attr.ib(Union['Keypair', 'OnlyPubkeyKeypair'])
+    multisig_key = attr.ib(Union['Keypair', 'OnlyPubkeyKeypair'])
+    htlc_basepoint = attr.ib(Union['Keypair', 'OnlyPubkeyKeypair'])
+    delayed_basepoint = attr.ib(Union['Keypair', 'OnlyPubkeyKeypair'])
+    revocation_basepoint = attr.ib(Union['Keypair', 'OnlyPubkeyKeypair'])
+    to_self_delay = attr.ib(int)
+    dust_limit_sat = attr.ib(int)
+    max_htlc_value_in_flight_msat = attr.ib(int)
+    max_accepted_htlcs = attr.ib(int)
+    initial_msat = attr.ib(int)
+    reserve_sat = attr.ib(int)
+
+@attr.s
+class LocalConfig(Config):
     # specific to "LOCAL" config
-    per_commitment_secret_seed: bytes
-    funding_locked_received: bool
-    was_announced: bool
-    current_commitment_signature: Optional[bytes]
-    current_htlc_signatures: bytes
+    per_commitment_secret_seed = attr.ib(bytes)
+    funding_locked_received = attr.ib(bool)
+    was_announced = attr.ib(bool)
+    current_commitment_signature = attr.ib(bytes)
+    current_htlc_signatures = attr.ib(bytes)
 
-
-class RemoteConfig(NamedTuple):
-    # shared channel config fields (DUPLICATED code!!)
-    payment_basepoint: Union['Keypair', 'OnlyPubkeyKeypair']
-    multisig_key: Union['Keypair', 'OnlyPubkeyKeypair']
-    htlc_basepoint: Union['Keypair', 'OnlyPubkeyKeypair']
-    delayed_basepoint: Union['Keypair', 'OnlyPubkeyKeypair']
-    revocation_basepoint: Union['Keypair', 'OnlyPubkeyKeypair']
-    to_self_delay: int
-    dust_limit_sat: int
-    max_htlc_value_in_flight_msat: int
-    max_accepted_htlcs: int
-    initial_msat: int
-    reserve_sat: int
+@attr.s
+class RemoteConfig(Config):
     # specific to "REMOTE" config
-    htlc_minimum_msat: int
-    next_per_commitment_point: bytes
-    revocation_store: 'RevocationStore'
-    current_per_commitment_point: Optional[bytes]
+    htlc_minimum_msat = attr.ib(int)
+    next_per_commitment_point = attr.ib(bytes)
+    revocation_store = attr.ib('RevocationStore')
+    current_per_commitment_point = attr.ib(bytes)
+
 
 
 class FeeUpdate(NamedTuple):
     rate: int  # in sat/kw
-    ctns: Dict['HTLCOwner', Optional[int]]
-
-    @classmethod
-    def from_dict(cls, d: dict) -> 'FeeUpdate':
-        return FeeUpdate(rate=d['rate'],
-                         ctns={LOCAL: d['ctns'][str(int(LOCAL))],
-                               REMOTE: d['ctns'][str(int(REMOTE))]})
-
-    def to_dict(self) -> dict:
-        return {'rate': self.rate,
-                'ctns': {int(LOCAL): self.ctns[LOCAL],
-                         int(REMOTE): self.ctns[REMOTE]}}
+    ctn_local: Optional[int]
+    ctn_remote: Optional[int]
 
 
-ChannelConstraints = namedtuple("ChannelConstraints", ["capacity", "is_initiator", "funding_txn_minimum_depth"])
+@attr.s
+class ChannelConstraints(StoredAttr):
+    capacity = attr.ib(int)
+    is_initiator = attr.ib(bool)
+    funding_txn_minimum_depth = attr.ib(int)
 
 
 class ScriptHtlc(NamedTuple):
@@ -111,7 +129,10 @@ class ScriptHtlc(NamedTuple):
 
 
 # FIXME duplicate of TxOutpoint in transaction.py??
-class Outpoint(NamedTuple("Outpoint", [('txid', str), ('output_index', int)])):
+@attr.s
+class Outpoint(StoredAttr):
+    txid = attr.ib(str)
+    output_index = attr.ib(int)
     def to_str(self):
         return "{}:{}".format(self.txid, self.output_index)
 
@@ -201,6 +222,9 @@ class RevocationStore:
 
     def serialize(self):
         return {"index": self.index, "buckets": [[bh2u(k.secret), k.index] if k is not None else None for k in self.buckets]}
+
+    def to_json(self):
+        return self.serialize()
 
     @staticmethod
     def from_json_obj(decoded_json_obj):

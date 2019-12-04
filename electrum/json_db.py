@@ -30,22 +30,41 @@ import threading
 from collections import defaultdict
 from typing import Dict, Optional, List, Tuple, Set, Iterable, NamedTuple, Sequence
 import jsonpatch
+import binascii
 
 from . import util, bitcoin
 from .util import profiler, WalletFileException, multisig_type, TxMinedInfo, bfh, PR_TYPE_ONCHAIN
 from .keystore import bip44_derivation
 from .transaction import Transaction, TxOutpoint, PartialTxOutput
 from .logging import Logger
+from .lnutil import LOCAL, REMOTE, FeeUpdate, UpdateAddHtlc, LocalConfig, RemoteConfig, Keypair, OnlyPubkeyKeypair, RevocationStore
+from .lnutil import ChannelConstraints, Outpoint
+from .lnutil import StoredAttr
 
 # seed_version is now used for the version of the wallet file
 
 OLD_SEED_VERSION = 4        # electrum versions < 2.0
 NEW_SEED_VERSION = 11       # electrum versions >= 2.0
-FINAL_SEED_VERSION = 23     # electrum >= 2.7 will set this to prevent
+FINAL_SEED_VERSION = 24     # electrum >= 2.7 will set this to prevent
                             # old versions from overwriting new format
 
 
 JsonDBJsonEncoder = util.MyEncoder
+
+
+def decodeAll(d, local):
+    for k, v in d.items():
+        if k == 'revocation_store':
+            yield (k, RevocationStore.from_json_obj(v))
+        elif k.endswith("_basepoint") or k.endswith("_key"):
+            if local:
+                yield (k, Keypair(**dict(decodeAll(v, local))))
+            else:
+                yield (k, OnlyPubkeyKeypair(**dict(decodeAll(v, local))))
+        elif k in ["node_id", "channel_id", "short_channel_id", "pubkey", "privkey", "current_per_commitment_point", "next_per_commitment_point", "per_commitment_secret_seed", "current_commitment_signature", "current_htlc_signatures"] and v is not None:
+            yield (k, binascii.unhexlify(v))
+        else:
+            yield (k, v)
 
 
 class TxFeesValue(NamedTuple):
@@ -57,32 +76,49 @@ class TxFeesValue(NamedTuple):
 class StorageDict(dict):
 
     def __init__(self, db, path, data):
-        #self.update(data)
         self.db = db
         self.path = path
+        # recursively convert dicts to storagedict
         for k, v in list(data.items()):
-            # recursively convert dicts to storagedict
             self.__setitem__(k, v, patch=False)
 
+    def convert_key(self, key):
+        # convert int, HTLCOwner to str
+        return key if type(key) is str else str(int(key))
+
     def __setitem__(self, key, value, patch=True):
+        key = self.convert_key(key)
         is_dict = type(value) is dict
         is_new = key not in self
         # early return to prevent unnecessary disk writes
         if not is_new and self[key] == value:
             return
+        # set parent of StoredAttr
+        if isinstance(value, StoredAttr):
+            value.set_parent(self, key)
         # convert dict to StorageDict
         v = StorageDict(self.db, self.path+'/'+key, value) if is_dict else value
+        # set item
         dict.__setitem__(self, key, v)
-        if patch:
+        if self.db and patch:
             path = self.path + '/' + str(key)
             op = 'add' if is_new else 'replace'
             self.db.add_patch({'op': op, 'path': path, 'value': value})
 
     def __delitem__(self, key):
+        key = self.convert_key(key)
         path = self.path + '/' + str(key)
-        self.db.add_patch({'op': 'remove', 'path': path})
+        if self.db:
+            self.db.add_patch({'op': 'remove', 'path': path})
         return dict.__delitem__(self, key)
 
+    def __getitem__(self, key):
+        key = self.convert_key(key)
+        return dict.__getitem__(self, key)
+
+    def __contains__(self, key):
+        key = self.convert_key(key)
+        return dict.__contains__(self, key)
 
 
 class JsonDB(Logger):
@@ -270,6 +306,7 @@ class JsonDB(Logger):
         self._convert_version_21()
         self._convert_version_22()
         self._convert_version_23()
+        self._convert_version_24()
         self.put('seed_version', FINAL_SEED_VERSION)  # just to be sure
 
         self._after_upgrade_tasks()
@@ -609,6 +646,14 @@ class JsonDB(Logger):
                 self.data[key[:-1]] = self.data.pop(key)
 
         self.data['seed_version'] = 23
+
+    def _convert_version_24(self):
+        if not self._is_upgrade_method_needed(23, 23):
+            return
+        channels = self.get('channels', [])
+        self.data['channels'] = { x['channel_id']: x for x in channels }
+        # unacked_local_updates2, fee_updates
+        self.data['seed_version'] = 24
 
     def _convert_imported(self):
         if not self._is_upgrade_method_needed(0, 13):
@@ -1030,6 +1075,24 @@ class JsonDB(Logger):
             if invoice.get('type') == PR_TYPE_ONCHAIN:
                 outputs = [PartialTxOutput.from_legacy_tuple(*output) for output in invoice.get('outputs')]
                 invoice.__setitem__('outputs', outputs, patch=False)
+        # convert FeeUpdate and UpdateAddHtlc
+        for k, c in self.get_dict('channels').items():
+            local_config = LocalConfig(**dict(decodeAll(c["local_config"], True)))
+            c.__setitem__('local_config', local_config, patch=False)
+            remote_config = RemoteConfig(**dict(decodeAll(c["remote_config"], False)))
+            c.__setitem__('remote_config', remote_config, patch=False)
+            constraints = ChannelConstraints(**c["constraints"])
+            c.__setitem__('constraints', constraints, patch=False)
+            funding_outpoint = Outpoint(**dict(decodeAll(c["funding_outpoint"], False)))
+            c.__setitem__('funding_outpoint', funding_outpoint, patch=False)
+            log = c['log']
+            for sub in (LOCAL, REMOTE):
+                d = log[sub]
+                for htlc_id, htlc in d['adds'].items():
+                    d['adds'].__setitem__(htlc_id, UpdateAddHtlc(*htlc), patch=False)
+                for i, fee_upd in d['fee_updates'].items():
+                    d['fee_updates'].__setitem__(i, FeeUpdate(*fee_upd), patch=False)
+
 
     @modifier
     def clear_history(self):
